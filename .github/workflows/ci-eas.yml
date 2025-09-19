@@ -1,0 +1,168 @@
+name: 📱 EAS Build & Submit
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: "Which build to run?"
+        required: true
+        default: "development"
+        type: choice
+        options:
+          - development
+          - production
+          - preview
+
+jobs:
+  eas-build:
+    runs-on: ubuntu-latest
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      EXPO_ACCOUNT_NAME: ${{ secrets.EXPO_ACCOUNT_NAME }}
+      EXPO_PROJECT_NAME: ${{ secrets.EXPO_PROJECT_NAME }}
+    steps:
+      - name: 🏷️ Checkout
+        uses: actions/checkout@v3
+
+      - name: 🏷️ Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: yarn
+
+      - name: 🏷️ Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: 🛠️ Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: 🚀 Run EAS Builds
+        id: build
+        run: |
+          target="${{ github.event.inputs.build_target }}"
+          echo "Running build target: $target"
+
+          declare -A BUILD_IDS
+          declare -A BUILD_URLS
+          declare -A ARTIFACT_URLS
+          declare -A APP_VERSIONS
+          declare -A SDK_VERSIONS
+          declare -A BUILD_NUMBERS
+          declare -A QR_CODES
+
+          run_build() {
+            local profile=$1
+            local platform=$2
+            echo "⚡ Building $profile for $platform..."
+
+            build_json=$(eas build --platform android --profile "$profile" --non-interactive --json)
+
+            build_id=$(echo "$build_json" | jq -r 'if type=="array" then .[0].id else .id end')
+            artifact_url=$(echo "$build_json" | jq -r 'if type=="array" then .[0].artifacts.applicationArchiveUrl else .artifacts.applicationArchiveUrl end')
+            app_version=$(echo "$build_json" | jq -r 'if type=="array" then .[0].appVersion else .appVersion end // "N/A"')
+            sdk_version=$(echo "$build_json" | jq -r 'if type=="array" then .[0].sdkVersion else .sdkVersion end // "N/A"')
+            build_number=$(echo "$build_json" | jq -r 'if type=="array" then .[0].buildNumber else .buildNumber end // "N/A"')
+
+            build_url="https://expo.dev/accounts/${EXPO_ACCOUNT_NAME}/projects/${EXPO_PROJECT_NAME}/builds/$build_id"
+            qr_code_url="https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=$build_url"
+
+            BUILD_IDS[$platform]="$build_id"
+            ARTIFACT_URLS[$platform]="$artifact_url"
+            APP_VERSIONS[$platform]="$app_version"
+            SDK_VERSIONS[$platform]="$sdk_version"
+            BUILD_NUMBERS[$platform]="$build_number"
+            BUILD_URLS[$platform]="$build_url"
+            QR_CODES[$platform]="$qr_code_url"
+
+            echo "build_id_$platform=$build_id" >> $GITHUB_ENV
+            echo "artifact_url_$platform=$artifact_url" >> $GITHUB_ENV
+            echo "build_url_$platform=$build_url" >> $GITHUB_ENV
+            echo "qr_code_url_$platform=$qr_code_url" >> $GITHUB_ENV
+            echo "app_version_$platform=$app_version" >> $GITHUB_ENV
+            echo "sdk_version_$platform=$sdk_version" >> $GITHUB_ENV
+            echo "build_number_$platform=$build_number" >> $GITHUB_ENV
+          }
+
+          case "$target" in
+            development)
+              run_build development ios
+              run_build development android
+              ;;
+            android-qa)
+              run_build qa android
+              ;;
+            android-stage)
+              run_build stage android
+              ;;
+            android-prod)
+              run_build prod android
+              ;;
+            ios)
+              run_build production ios
+              ;;
+            all)
+              run_build qa android
+              run_build stage android
+              run_build prod android
+              run_build production ios
+              ;;
+            *)
+              echo "❌ Invalid build target: $target"
+              exit 1
+              ;;
+          esac
+
+      - name: 📦 Publish Summary and Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          STATUS="${{ job.status }}"
+          EMOJI="✅"
+          TITLE="🚀 EAS Build Completed!"
+          COLOR="#2eb886"
+
+          if [ "$STATUS" != "success" ]; then
+            EMOJI="❌"
+            TITLE="📉 EAS Build Failed!"
+            COLOR="#ff0000"
+          fi
+
+          echo "## $TITLE $EMOJI" >> $GITHUB_STEP_SUMMARY
+          MESSAGE="*$TITLE for Project \`${EXPO_PROJECT_NAME}\`*"
+
+          for p in android ios; do
+            build_id="${BUILD_IDS[$p]}"
+            artifact_url="${ARTIFACT_URLS[$p]}"
+            build_url="${BUILD_URLS[$p]}"
+            qr_code_url="${QR_CODES[$p]}"
+            app_version="${APP_VERSIONS[$p]}"
+            sdk_version="${SDK_VERSIONS[$p]}"
+            build_number="${BUILD_NUMBERS[$p]}"
+
+            if [ -n "$build_id" ]; then
+              echo "### 📱 $p Build" >> $GITHUB_STEP_SUMMARY
+              echo "**App Version:** $app_version" >> $GITHUB_STEP_SUMMARY
+              echo "**Expo SDK:** $sdk_version" >> $GITHUB_STEP_SUMMARY
+              echo "**Build Number:** $build_number" >> $GITHUB_STEP_SUMMARY
+              echo "**🔗 Build URL:** [View Build]($build_url)" >> $GITHUB_STEP_SUMMARY
+              echo "**📦 Artifact:** [Download]($artifact_url)" >> $GITHUB_STEP_SUMMARY
+              echo "![QR Code]($qr_code_url)" >> $GITHUB_STEP_SUMMARY
+
+              MESSAGE="$MESSAGE\n\n*$p Build:*\n🔗 <$build_url|View Build>\n📦 <$artifact_url|Download>\nApp: $app_version | SDK: $sdk_version | Build #: $build_number"
+            fi
+          done
+
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{
+              "text": "'"$MESSAGE"'",
+              "attachments": [
+                {
+                  "color": "'"$COLOR"'",
+                  "text": "📷 Scan QR Codes from summary to access builds"
+                }
+              ]
+            }' "$SLACK_WEBHOOK"
